@@ -1,0 +1,524 @@
+#include "stm32f4xx.h"
+#include "usart.h"
+#include "delay.h"
+#include "HIMI.h"
+#include <stdio.h>
+#include "IIC.h"
+#include "PWM.h"
+#include <string.h>
+#include "Control.h"
+#include "PID.h"
+#include "sys.h"
+#include "ESP8266.h"
+#include "sdio_sdcard.h"
+#include "AHI.h"
+
+// 新增：SD卡相关变量
+u8 sd_init_flag = 0;
+u32 sd_write_block = 0;
+#define SD_LOG_BLOCK_SIZE 512
+u8 sd_log_buffer[SD_LOG_BLOCK_SIZE];
+u16 sd_buf_idx = 0;
+
+// 其他原有变量保持不变...
+u8 statu = 0;
+uint8_t current_duty = 60;
+PID_Controller pressure_pid;
+uint32_t target_pressure = 10000;
+uint16_t current_pressure = 0;
+float pid_output = 0.0f;
+float inspiratory_time = 1.5f;
+float expiratory_time = 2.5f;
+float breath_ratio = 0.0f;
+uint8_t breath_ratio_int = 0;
+uint8_t pressure_ctrl_state = 0;
+int32_t last_flow = 0;
+#define FLOW_CHANGE_THRESHOLD 50
+#define FLOW_SAMPLE_COUNT 10
+int32_t flow_buffer[FLOW_SAMPLE_COUNT] = {0};
+uint8_t flow_buf_index = 0;
+uint8_t flow_sample_cnt = 0;
+int32_t total_flow_10times = 0;
+uint16_t total_flow_int = 0;
+
+// ===================== AHI 呼吸暂停低通气指数（纯标准库 无外部依赖） =====================
+uint16_t AHI_Value = 0;
+uint32_t apnea_count = 0;
+uint32_t hypopnea_count = 0;
+float sleep_total_minute = 0.0f;
+
+#define AHI_UPDATE_INTERVAL 5000
+#define FLOW_APNEA_THRESHOLD 50
+#define FLOW_HYPO_THRESHOLD  200
+
+// ===================== 升压时间计算 =====================
+uint32_t rise_start_tick = 0;
+uint16_t rise_time_ms = 0;
+uint8_t  is_rise_started = 0;
+#define PRESSURE_RISE_THRESHOLD 80
+
+// ===================== 人机同步等级 =====================
+const uint8_t sync_level = 3;
+
+// ===================== 漏气量专用变量 =====================
+#define LEAKAGE_FILTER_NUM  10
+int32_t leak_buffer[LEAKAGE_FILTER_NUM];
+uint8_t leak_idx = 0;
+uint16_t leak_value = 0;
+
+// 气道温湿度档位
+typedef enum {
+    AIR_HUMI_TEMP_LOW  = 1,
+    AIR_HUMI_TEMP_MID  = 2,
+    AIR_HUMI_TEMP_HIGH = 3
+} AirHumiTempLevel;
+
+AirHumiTempLevel air_level = AIR_HUMI_TEMP_MID;
+uint8_t air_level_val = 2;
+
+// 函数声明
+void SD_Log_Init(void);
+void SD_Log_Data(uint16_t press, uint16_t flow, uint16_t cumul_flow, uint8_t air_level, uint16_t leak, uint16_t ahi);
+void SD_Flush_Buffer(void);
+
+void Update_Flow_Buffer(int32_t instant_flow);
+void Reset_Flow_Buffer(void);
+float Calculate_Breath_Ratio(float insp_time, float exp_time);
+uint8_t hexToDec(uint8_t hexValue);
+void SettleTotalFlow(void);
+
+void Leakage_Put(int32_t leak_flow);
+uint16_t Leakage_Get(void);
+
+void AHI_Init(void);
+void Update_AHI(int32_t current_flow);
+void Calculate_Rise_Time(uint16_t now_press, uint32_t target_press);
+AirHumiTempLevel Get_Air_HumiTemp_Level(uint16_t temp, uint16_t humi);
+
+// ===================== AHI 初始化 =====================
+void AHI_Init(void)
+{
+    AHI_Value = 0;
+    apnea_count = 0;
+    hypopnea_count = 0;
+    sleep_total_minute = 0.0f;
+}
+
+// ===================== 极简安全计时：不依赖任何外部函数 =====================
+void Update_AHI(int32_t current_flow)
+{
+    static uint32_t cnt_1s = 0;
+    static uint32_t cnt_5s = 0;
+
+    // 1ms 触发一次
+    cnt_1s++;
+    cnt_5s++;
+
+    // 1 秒
+    if (cnt_1s >= 1000)
+    {
+        cnt_1s = 0;
+        sleep_total_minute += 1.0f / 60.0f;
+    }
+
+    // 呼吸事件判断
+    if (current_flow < FLOW_APNEA_THRESHOLD)
+    {
+        apnea_count++;
+    }
+    else if (current_flow < FLOW_HYPO_THRESHOLD)
+    {
+        hypopnea_count++;
+    }
+
+    // 5 秒更新一次 AHI
+    if (cnt_5s >= 5000)
+    {
+        cnt_5s = 0;
+        if (sleep_total_minute > 1.0f)
+        {
+            float hours = sleep_total_minute / 60.0f;
+            AHI_Value = (uint16_t)((apnea_count + hypopnea_count) / hours);
+        }
+    }
+}
+
+// ===================== 温湿度档位判断 =====================
+AirHumiTempLevel Get_Air_HumiTemp_Level(uint16_t temp, uint16_t humi)
+{
+    float t = temp / 100.0f;
+    float h = humi / 100.0f;
+
+    if (t < 32.0f && h < 60.0f)
+        return AIR_HUMI_TEMP_LOW;
+    else if (t >= 32.0f && t < 37.0f && h >= 60.0f && h < 80.0f)
+        return AIR_HUMI_TEMP_MID;
+    else
+        return AIR_HUMI_TEMP_HIGH;
+}
+
+// ===================== SD 日志初始化 =====================
+void SD_Log_Init(void)
+{
+    SD_Error error;
+    error = SD_Init();
+    if (error == SD_OK)
+    {
+        sd_init_flag = 1;
+        memset(sd_log_buffer, 0, SD_LOG_BLOCK_SIZE);
+        sd_buf_idx = 0;
+        sd_write_block = 0;
+
+        char header[] = "Time,Pressure,Flow,CumulativeFlow,AirLevel,Leakage,AHI\r\n";
+        uint16_t header_len = strlen(header);
+        if (header_len <= SD_LOG_BLOCK_SIZE)
+        {
+            memcpy(sd_log_buffer, header, header_len);
+            sd_buf_idx = header_len;
+        }
+    }
+    else
+    {
+        sd_init_flag = 0;
+    }
+}
+
+// ===================== SD 写入数据 =====================
+void SD_Log_Data(uint16_t press, uint16_t flow, uint16_t cumul_flow, uint8_t air_level, uint16_t leak, uint16_t ahi)
+{
+    if (!sd_init_flag) return;
+
+    static uint32_t log_count = 0;
+    char data_str[160];
+    uint16_t str_len;
+
+    str_len = sprintf(data_str, "%u,%u,%u,%u,%u,%u,%u\r\n",
+                     log_count++, press, flow, cumul_flow, air_level, leak, ahi);
+
+    if (sd_buf_idx + str_len >= SD_LOG_BLOCK_SIZE)
+    {
+        SD_WriteBlock(sd_log_buffer, sd_write_block * SD_LOG_BLOCK_SIZE, SD_LOG_BLOCK_SIZE);
+        sd_write_block++;
+        memset(sd_log_buffer, 0, SD_LOG_BLOCK_SIZE);
+        sd_buf_idx = 0;
+    }
+
+    memcpy(&sd_log_buffer[sd_buf_idx], data_str, str_len);
+    sd_buf_idx += str_len;
+}
+
+// ===================== SD 刷新缓冲区 =====================
+void SD_Flush_Buffer(void)
+{
+    if (!sd_init_flag || sd_buf_idx == 0) return;
+
+    if (sd_buf_idx < SD_LOG_BLOCK_SIZE)
+        memset(&sd_log_buffer[sd_buf_idx], 0, SD_LOG_BLOCK_SIZE - sd_buf_idx);
+
+    SD_WriteBlock(sd_log_buffer, sd_write_block * SD_LOG_BLOCK_SIZE, SD_LOG_BLOCK_SIZE);
+    sd_write_block++;
+    sd_buf_idx = 0;
+}
+
+// ===================== 呼吸比计算 =====================
+float Calculate_Breath_Ratio(float insp_time, float exp_time)
+{
+    if (exp_time <= 0.01f) return 0.0f;
+    breath_ratio = insp_time / exp_time;
+    return breath_ratio;
+}
+
+// ===================== 十六进制转十进制 =====================
+uint8_t hexToDec(uint8_t hexValue)
+{
+    uint8_t decValue = 0;
+    uint8_t base = 1;
+    while (hexValue != 0)
+    {
+        uint8_t digit = hexValue % 10;
+        if (digit >= 16) return 0;
+        decValue += digit * base;
+        base *= 16;
+        hexValue /= 10;
+    }
+    return decValue;
+}
+
+// ===================== 流量缓冲区更新 =====================
+void Update_Flow_Buffer(int32_t instant_flow)
+{
+    flow_buffer[flow_buf_index] = instant_flow;
+    flow_buf_index = (flow_buf_index + 1) % FLOW_SAMPLE_COUNT;
+    if (flow_sample_cnt < FLOW_SAMPLE_COUNT) flow_sample_cnt++;
+
+    total_flow_10times = 0;
+    for (uint8_t i = 0; i < FLOW_SAMPLE_COUNT; i++)
+        total_flow_10times += flow_buffer[i];
+
+    total_flow_int = (uint16_t)(total_flow_10times / 100.0f);
+}
+
+// ===================== 流量缓冲区重置 =====================
+void Reset_Flow_Buffer(void)
+{
+    memset(flow_buffer, 0, sizeof(flow_buffer));
+    flow_buf_index = 0;
+    flow_sample_cnt = 0;
+    total_flow_10times = 0;
+    total_flow_int = 0;
+}
+
+// ===================== 累计流量上传 =====================
+void SettleTotalFlow(void)
+{
+    printf("page3.x16.val=%d\xff\xff\xff", total_flow_int);
+    printf("add 44,0,%d\xff\xff\xff", total_flow_int);
+    USART_SendData(UART4, hexToDec(total_flow_int));
+    Reset_Flow_Buffer();
+}
+
+// ===================== 漏气量滤波 =====================
+void Leakage_Put(int32_t leak_flow)
+{
+    leak_buffer[leak_idx++] = leak_flow;
+    if (leak_idx >= LEAKAGE_FILTER_NUM) leak_idx = 0;
+}
+
+uint16_t Leakage_Get(void)
+{
+    int32_t sum = 0;
+    for (int i = 0; i < LEAKAGE_FILTER_NUM; i++) sum += leak_buffer[i];
+    return (uint16_t)(sum / LEAKAGE_FILTER_NUM / 100);
+}
+
+// ===================== 升压时间 =====================
+void Calculate_Rise_Time(uint16_t now_press, uint32_t target_press)
+{
+    rise_time_ms = 0;
+    is_rise_started = 0;
+}
+
+// ===================== 主函数 =====================
+int main(void)
+{
+    uint16_t temperature = 0;
+    int32_t flow = 0;
+    int32_t leak_flow = 0;
+    uint16_t humidity = 0;
+    int32_t pressure = 0;
+    uint16_t press_int, flow_int;
+
+    // 外设初始化
+    RCC_Configuration();
+    GPIO_Configuration();
+    NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
+    delay_init(168);
+    I2C1_Init();
+    TIM3_PWM_Init(100 - 1, 840 - 1);
+    TIM_SetCompare1(TIM3, current_duty);
+    USART3_Init(115200);
+    USART4_Init(115200);
+    ESP8266_Huaweiyun_Init();
+
+    SD_Log_Init();
+    AHI_Init();
+
+    PID_Init(&pressure_pid, 0.5f, 0.1f, 0.05f, 100.0f, 100.0f);
+    PID_SetTarget(&pressure_pid, target_pressure);
+
+    while (1)
+    {
+        // 状态机
+        if (statu == 1)
+        {
+            GPIO_SetBits(GPIOD, GPIO_Pin_8);
+            GPIO_ResetBits(GPIOD, GPIO_Pin_9);
+            statu = 0;
+        }
+        else if (statu == 2)
+        {
+            if (current_duty < 100)
+            {
+                current_duty += 10;
+                TIM_SetCompare1(TIM3, current_duty);
+            }
+            statu = 0;
+        }
+        else if (statu == 3)
+        {
+            if (current_duty > 0)
+            {
+                current_duty -= 10;
+                TIM_SetCompare1(TIM3, current_duty);
+            }
+            statu = 0;
+        }
+        else if (statu == 4)
+        {
+            GPIO_ResetBits(GPIOD, GPIO_Pin_8);
+            GPIO_SetBits(GPIOD, GPIO_Pin_9);
+            statu = 0;
+        }
+        else if (statu == 6)
+        {
+            if (target_pressure > 1000)
+            {
+                target_pressure -= 1000;
+                PID_SetTarget(&pressure_pid, target_pressure);
+            }
+            statu = 0;
+        }
+        else if (statu == 7)
+        {
+            SettleTotalFlow();
+            statu = 0;
+        }
+        else if (statu == 8)
+        {
+            SD_Flush_Buffer();
+            statu = 0;
+        }
+
+        // 恒压控制
+        switch (pressure_ctrl_state)
+        {
+            case 1:
+                if (statu == 9)
+                {
+                    pressure_ctrl_state = 2;
+                    statu = 0;
+                }
+                break;
+
+            case 2:
+                if (QueryPressure(&pressure))
+                    current_pressure = (uint16_t)(pressure / 1000.0f);
+
+                if (QueryInstantFlow(&flow))
+                {
+                    if (flow > last_flow + FLOW_CHANGE_THRESHOLD)
+                    {
+                        if (target_pressure < 20000)
+                        {
+                            target_pressure += 500;
+                            PID_SetTarget(&pressure_pid, target_pressure);
+                        }
+                    }
+                    last_flow = flow;
+                }
+
+                pid_output = PID_Compute(&pressure_pid, current_pressure, 0.1f);
+                current_duty = (uint8_t)pid_output;
+                if (current_duty > 100) current_duty = 100;
+                if (current_duty < 0) current_duty = 0;
+                TIM_SetCompare1(TIM3, current_duty);
+                break;
+
+            default:
+                break;
+        }
+
+        Calculate_Rise_Time(current_pressure, target_pressure);
+        Update_AHI(flow);
+        delay_ms(1);  // 保证 1ms 精度
+
+        // 呼吸比
+        Calculate_Breath_Ratio(inspiratory_time, expiratory_time);
+        breath_ratio_int = (uint8_t)(breath_ratio * 10);
+        printf("page3.x11.val=%d\xff\xff\xff", breath_ratio_int);
+        USART_SendData(UART4, hexToDec(breath_ratio_int));
+        delay_ms(20);
+
+        // 升压时间
+        printf("page3.x15.val=%d\xff\xff\xff", rise_time_ms);
+        USART_SendData(UART4, hexToDec(rise_time_ms));
+        delay_ms(10);
+
+        // 同步等级
+        printf("page3.x16.val=%d\xff\xff\xff", sync_level);
+        USART_SendData(UART4, sync_level);
+        delay_ms(10);
+
+        // AHI 上传屏幕
+        printf("page3.x4.val=%d\xff\xff\xff", AHI_Value);
+        USART_SendData(UART4, hexToDec(AHI_Value));
+        delay_ms(10);
+
+        // 压力
+        if (QueryPressure(&pressure))
+        {
+            press_int = (int)(pressure / 1000.0f);
+            printf("page3.x7.val=%d\xff\xff\xff", press_int);
+            printf("add 41,0,%d\xff\xff\xff", press_int);
+            USART_SendData(UART4, hexToDec(press_int));
+            delay_ms(10);
+        }
+
+        // 温湿度档位
+        if (QueryTemperature(&temperature) && QueryHumidity(&humidity))
+        {
+            air_level = Get_Air_HumiTemp_Level(temperature, humidity);
+            air_level_val = (uint8_t)air_level;
+            printf("page3.x3.val=%d\xff\xff\xff", air_level_val);
+            USART_SendData(UART4, hexToDec(air_level_val));
+            delay_ms(10);
+        }
+
+        // 流量 & 漏气
+        if (QueryInstantFlow(&flow))
+        {
+            flow_int = (int)(flow / 100.0f);
+            if (flow_int < 1000)
+            {
+                printf("page3.n0.val=%d\xff\xff\xff", flow_int);
+                printf("add 42,0,%d\xff\xff\xff", flow_int);
+                USART_SendData(UART4, hexToDec(flow_int));
+            }
+
+            Update_Flow_Buffer(flow);
+            printf("page3.x14.val=%d\xff\xff\xff", total_flow_int);
+
+            leak_flow = (flow > 0 && flow < 2000) ? flow : 0;
+            Leakage_Put(leak_flow);
+            leak_value = Leakage_Get();
+
+            printf("page3.x6.val=%d\xff\xff\xff", leak_value);
+            USART_SendData(UART4, hexToDec(leak_value));
+            delay_ms(10);
+        }
+
+        // 华为云
+        Serial_4_Printf("AT+MQTTPUB=0,\"$oc/devices/ximenzi/sys/properties/report\",\"{\\\"services\\\":[{\\\"service_id\\\":\\\"information\\\"\\,\\\"properties\\\":{\\\"Pressure\\\":%d\\,\\\"FlowRate\\\":%d\\,\\\"RespiratoryRatio\\\":%d\\,\\\"CumulativeFlow\\\":%d\\,\\\"AirHumidTemp\\\":%d\\,\\\"Leakage\\\":%d\\,\\\"AHI\\\":%d}}]}\",1,0\r\n",
+             (int)(pressure / 1000.0f), (int)(flow / 100.0f), breath_ratio_int, total_flow_int, air_level_val, leak_value, AHI_Value);
+        delay_ms(10);
+
+        // SD 记录
+        if (sd_init_flag)
+        {
+            SD_Log_Data(press_int, flow_int, total_flow_int, air_level_val, leak_value, AHI_Value);
+        }
+    }
+}
+
+// ===================== 串口3中断 =====================
+void USART3_IRQHandler(void)
+{
+    if (USART_GetITStatus(USART3, USART_IT_RXNE) != RESET)
+    {
+        u8 RxData = USART_ReceiveData(USART3);
+        statu = RxData;
+
+        if (RxData == 5)
+        {
+            pressure_ctrl_state = 1;
+        }
+        else if (RxData == 0)
+        {
+            pressure_ctrl_state = 0;
+            current_duty = 60;
+            TIM_SetCompare1(TIM3, current_duty);
+        }
+
+        USART_ClearITPendingBit(USART3, USART_IT_RXNE);
+    }
+}
